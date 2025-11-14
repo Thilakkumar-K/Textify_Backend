@@ -11,6 +11,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, field_validator
 from typing import List, Optional, Dict, Any, Tuple
+from vector_cache import get_vector_cache
 import httpx
 import asyncio
 import logging
@@ -637,16 +638,17 @@ class GoogleDriveProcessor:
 
 
 class VectorStore:
-    """FAISS-based vector store with direct Supabase storage"""
+    """FAISS-based vector store with in-memory caching"""
 
     def __init__(self):
         self.embedding_model = SentenceTransformer(EMBEDDING_MODEL_NAME)
         self.dimension = self.embedding_model.get_sentence_embedding_dimension()
+        self.cache = get_vector_cache()  # Initialize cache
         logger.info(f"✅ Initialized vector store with {EMBEDDING_MODEL_NAME} (dim: {self.dimension})")
 
     async def create_embeddings(self, document_id: str, chunks: List[Dict[str, Any]],
                                 file_name: str = None, source_info: Dict[str, Any] = None) -> int:
-        """Create embeddings and store directly in Supabase"""
+        """Create embeddings and store in Supabase + cache"""
         try:
             logger.info(f"Creating embeddings for {len(chunks)} chunks")
 
@@ -663,15 +665,25 @@ class VectorStore:
 
             embeddings = np.vstack(all_embeddings).astype('float32')
 
-            # Create FAISS index
-            index = faiss.IndexFlatIP(self.dimension)
-            faiss.normalize_L2(embeddings)
-            index.add(embeddings)
-
             # Save to Supabase
             await self._save_to_supabase_direct(document_id, embeddings, chunks, file_name, source_info)
 
-            logger.info(f"Created and saved {len(chunks)} vectors to Supabase")
+            # Cache in memory for instant access
+            metadata = {
+                "document_id": document_id,
+                "chunks_count": len(chunks),
+                "embedding_model": EMBEDDING_MODEL_NAME,
+                "dimension": self.dimension,
+                "created_at": time.time(),
+                "total_characters": sum(chunk["char_count"] for chunk in chunks),
+                "file_name": file_name,
+                "original_filename": source_info.get("original_filename", file_name) if source_info else file_name,
+                "sanitized_filename": source_info.get("sanitized_filename", file_name) if source_info else file_name,
+                "source_info": source_info or {}
+            }
+            self.cache.set(document_id, embeddings, chunks, metadata)
+
+            logger.info(f"✅ Created and cached {len(chunks)} vectors")
             return len(chunks)
 
         except Exception as e:
@@ -683,20 +695,40 @@ class VectorStore:
 
     async def search_similar_chunks(self, document_id: str, query: str, top_k: int = TOP_K_RETRIEVAL) -> List[
         Dict[str, Any]]:
-        """Search for similar chunks"""
+        """Search for similar chunks using cached data"""
         try:
-            embeddings, chunks = await self._load_from_supabase_direct(document_id)
+            # Try to get from cache first
+            cached_data = self.cache.get(document_id)
 
-            index = faiss.IndexFlatIP(self.dimension)
-            faiss.normalize_L2(embeddings)
-            index.add(embeddings)
+            if cached_data:
+                logger.info(f"🚀 Using cached vectors for document {document_id}")
+                embeddings = cached_data["embeddings"]
+                chunks = cached_data["chunks"]
+                index = cached_data["faiss_index"]
+            else:
+                # Load from Supabase only if not cached
+                logger.info(f"📥 Loading vectors from Supabase for document {document_id}")
+                embeddings, chunks = await self._load_from_supabase_direct(document_id)
 
+                # Create FAISS index
+                index = faiss.IndexFlatIP(self.dimension)
+                embeddings_normalized = embeddings.astype('float32')
+                faiss.normalize_L2(embeddings_normalized)
+                index.add(embeddings_normalized)
+
+                # Cache for future use
+                metadata = {"document_id": document_id, "chunks_count": len(chunks)}
+                self.cache.set(document_id, embeddings, chunks, metadata)
+
+            # Generate query embedding
             query_embedding = self.embedding_model.encode([query])
             query_embedding = query_embedding.astype('float32')
             faiss.normalize_L2(query_embedding)
 
+            # Search using cached FAISS index
             scores, indices = index.search(query_embedding, min(top_k, index.ntotal))
 
+            # Build results
             retrieved_chunks = []
             for i, (score, idx) in enumerate(zip(scores[0], indices[0])):
                 if idx != -1:
@@ -716,7 +748,7 @@ class VectorStore:
 
     async def _save_to_supabase_direct(self, document_id: str, embeddings: np.ndarray, chunks: List[Dict[str, Any]],
                                        file_name: str = None, source_info: Dict[str, Any] = None):
-        """Save embeddings and chunks to Supabase"""
+        """Save embeddings and chunks to Supabase (unchanged)"""
         try:
             # Save embeddings
             embeddings_bytes = io.BytesIO()
@@ -755,7 +787,7 @@ class VectorStore:
             raise
 
     async def _load_from_supabase_direct(self, document_id: str) -> Tuple[np.ndarray, List[Dict[str, Any]]]:
-        """Load embeddings and chunks from Supabase"""
+        """Load embeddings and chunks from Supabase (unchanged)"""
         try:
             # Load embeddings
             embeddings_path = f"vectors/{document_id}/embeddings.npy"
@@ -779,8 +811,12 @@ class VectorStore:
             )
 
     async def delete_document_vectors(self, document_id: str) -> bool:
-        """Delete document vectors from Supabase"""
+        """Delete document vectors from Supabase AND cache"""
         try:
+            # Remove from cache first
+            self.cache.remove(document_id)
+
+            # Delete from Supabase
             embeddings_path = f"vectors/{document_id}/embeddings.npy"
             chunks_path = f"vectors/{document_id}/chunks.json"
             metadata_path = f"vectors/{document_id}/metadata.json"
@@ -801,8 +837,15 @@ class VectorStore:
             return False
 
     async def list_stored_documents(self) -> List[Dict[str, Any]]:
-        """List all documents with vector data in Supabase"""
+        """List all documents - use cache if initialized, otherwise load from Supabase"""
         try:
+            # If cache is initialized, return cached metadata (instant response)
+            if self.cache.is_initialized():
+                logger.info("🚀 Returning documents from cache")
+                return self.cache.get_all_metadata()
+
+            # Otherwise, load from Supabase and populate cache
+            logger.info("📥 Loading documents from Supabase (first time)")
             files = await list_supabase_files(prefix="vectors/")
 
             documents = []
@@ -845,35 +888,68 @@ class VectorStore:
             logger.error(f"Error listing documents: {e}")
             return []
 
-    async def get_document_chunks(self, document_id: str) -> List[Dict[str, Any]]:
-        """Get chunks for a specific document"""
+    async def preload_all_vectors(self):
+        """
+        Preload all vectors into cache at startup
+        Call this during application startup for best performance
+        """
         try:
-            chunks_path = f"vectors/{document_id}/chunks.json"
-            chunks_bytes = await download_file_from_supabase(chunks_path)
-            chunks_json = chunks_bytes.decode('utf-8')
-            chunks = json.loads(chunks_json)
-            return chunks
+            logger.info("🔄 Preloading all vectors into cache...")
+
+            files = await list_supabase_files(prefix="vectors/")
+            seen_doc_ids = set()
+
+            for file_info in files:
+                file_path = file_info.get('name', '')
+
+                if file_path.startswith('vectors/') and file_path.endswith('/metadata.json'):
+                    try:
+                        path_parts = file_path.split('/')
+                        if len(path_parts) >= 3:
+                            document_id = path_parts[1]
+
+                            if document_id in seen_doc_ids or self.cache.is_cached(document_id):
+                                continue
+                            seen_doc_ids.add(document_id)
+
+                            # Load embeddings, chunks, and metadata
+                            logger.info(f"Loading document {document_id}...")
+                            embeddings, chunks = await self._load_from_supabase_direct(document_id)
+
+                            metadata_bytes = await download_file_from_supabase(file_path)
+                            metadata = json.loads(metadata_bytes.decode('utf-8'))
+
+                            # Cache it
+                            self.cache.set(document_id, embeddings, chunks, metadata)
+
+                    except Exception as e:
+                        logger.warning(f"Failed to preload document {document_id}: {e}")
+                        continue
+
+            self.cache.mark_initialized()
+            stats = self.cache.get_stats()
+            logger.info(f"✅ Preloading complete: {stats['total_documents']} documents, {stats['total_chunks']} chunks")
+
         except Exception as e:
-            logger.error(f"Error getting chunks: {e}")
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Chunks not found for document {document_id}"
-            )
+            logger.error(f"Error preloading vectors: {e}")
 
     async def search_across_documents(self, query: str, top_k: int = 10, max_docs: int = 5) -> List[Dict[str, Any]]:
-        """Search across all documents"""
+        """Search across all documents using cached data"""
         try:
+            # Get all documents (will use cache if available)
             all_documents = await self.list_stored_documents()
 
             if not all_documents:
                 return []
 
+            # Shortlist documents
             shortlisted_docs = sorted(
                 all_documents,
                 key=lambda x: (x.get('created_at', 0), x.get('total_characters', 0)),
                 reverse=True
             )[:max_docs]
 
+            # Search tasks
             search_tasks = []
             for doc in shortlisted_docs:
                 task = self._search_single_document_with_metadata(doc, query, top_k)
@@ -900,7 +976,7 @@ class VectorStore:
 
     async def search_filtered_documents(self, query: str, document_ids: List[str], top_k: int = 10) -> List[
         Dict[str, Any]]:
-        """Search across specific documents"""
+        """Search across specific documents using cached data"""
         try:
             all_documents = await self.list_stored_documents()
 
@@ -946,16 +1022,31 @@ class VectorStore:
 
     async def _search_single_document_with_metadata(self, doc_metadata: Dict[str, Any], query: str, top_k: int) -> List[
         Dict[str, Any]]:
-        """Search a single document and add metadata"""
+        """Search a single document using cached data"""
         try:
             document_id = doc_metadata['document_id']
 
-            embeddings, chunks = await self._load_from_supabase_direct(document_id)
+            # Try cache first
+            cached_data = self.cache.get(document_id)
 
-            index = faiss.IndexFlatIP(self.dimension)
-            faiss.normalize_L2(embeddings)
-            index.add(embeddings)
+            if cached_data:
+                embeddings = cached_data["embeddings"]
+                chunks = cached_data["chunks"]
+                index = cached_data["faiss_index"]
+            else:
+                # Load from Supabase if not cached
+                embeddings, chunks = await self._load_from_supabase_direct(document_id)
 
+                index = faiss.IndexFlatIP(self.dimension)
+                embeddings_normalized = embeddings.astype('float32')
+                faiss.normalize_L2(embeddings_normalized)
+                index.add(embeddings_normalized)
+
+                # Cache it
+                metadata = {"document_id": document_id, "chunks_count": len(chunks)}
+                self.cache.set(document_id, embeddings, chunks, metadata)
+
+            # Query
             query_embedding = self.embedding_model.encode([query])
             query_embedding = query_embedding.astype('float32')
             faiss.normalize_L2(query_embedding)
@@ -980,11 +1071,25 @@ class VectorStore:
             logger.warning(f"Failed to search document {document_id}: {e}")
             return []
 
+    async def get_document_chunks(self, document_id: str) -> List[Dict[str, Any]]:
+        """Get chunks for a specific document (use cache if available)"""
+        try:
+            cached_data = self.cache.get(document_id)
+            if cached_data:
+                return cached_data["chunks"]
 
-# Initialize services
-vector_store = None
-azure_openai_service = None
-
+            # Load from Supabase
+            chunks_path = f"vectors/{document_id}/chunks.json"
+            chunks_bytes = await download_file_from_supabase(chunks_path)
+            chunks_json = chunks_bytes.decode('utf-8')
+            chunks = json.loads(chunks_json)
+            return chunks
+        except Exception as e:
+            logger.error(f"Error getting chunks: {e}")
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail=f"Chunks not found for document {document_id}"
+            )
 
 # API Routes
 @app.get("/")
@@ -1014,7 +1119,7 @@ async def list_all_documents():
 
 @app.get("/api/v1/health")
 async def health_check():
-    """Enhanced health check with Azure OpenAI status"""
+    """Enhanced health check with cache statistics"""
     supabase_status = "unknown"
     try:
         supabase_manager = get_supabase_manager()
@@ -1024,6 +1129,7 @@ async def health_check():
         supabase_status = f"error: {str(e)[:100]}"
 
     azure_openai_info = azure_openai_service.get_service_info() if azure_openai_service else {}
+    cache_stats = vector_store.cache.get_stats() if vector_store else {}
 
     return {
         "status": "healthy",
@@ -1036,7 +1142,10 @@ async def health_check():
             "azure_openai_deployment": azure_openai_info.get("deployment_name"),
             "embedding_model": EMBEDDING_MODEL_NAME,
             "vector_store_ready": vector_store is not None,
-            "supabase_status": supabase_status
+            "supabase_status": supabase_status,
+            "cache_initialized": cache_stats.get("initialized", False),
+            "cached_documents": cache_stats.get("total_documents", 0),
+            "cached_chunks": cache_stats.get("total_chunks", 0)
         },
         "configuration": {
             "chunk_size": CHUNK_SIZE,
@@ -1044,8 +1153,9 @@ async def health_check():
             "top_k_retrieval": TOP_K_RETRIEVAL,
             "max_context_length": MAX_CONTEXT_LENGTH,
             "supabase_bucket": os.getenv("SUPABASE_BUCKET", "documents"),
-            "storage_mode": "FULL_SUPABASE_ONLY"
-        }
+            "storage_mode": "SUPABASE_WITH_MEMORY_CACHE"
+        },
+        "cache_stats": cache_stats
     }
 
 
@@ -1054,7 +1164,7 @@ async def upload_document(
         file: UploadFile = File(...),
         token: str = Depends(verify_token)
 ):
-    """Upload and process document for RAG"""
+    """Upload and process document for RAG with automatic caching"""
     try:
         document_id = str(uuid.uuid4())
         timestamp = int(time.time())
@@ -1083,14 +1193,17 @@ async def upload_document(
             "upload_method": "multipart_form"
         }
 
+        # This will automatically cache the document
         chunks_created = await vector_store.create_embeddings(document_id, chunks, file.filename, source_info)
+
+        logger.info(f"✅ Document uploaded and cached: {document_id}")
 
         return DocumentUploadResponse(
             document_id=document_id,
             filename=file.filename,
-            status="processed",
+            status="processed_and_cached",
             chunks_created=chunks_created,
-            message=f"Document processed successfully with {chunks_created} chunks",
+            message=f"Document processed and cached successfully with {chunks_created} chunks",
             supabase_path=uploaded_path,
             public_url=public_url if public_url else None
         )
@@ -1110,7 +1223,7 @@ async def process_document_qa_rag(
         request: DocumentQARequest,
         token: str = Depends(verify_token)
 ):
-    """RAG-powered document QA endpoint with Azure OpenAI"""
+    """RAG-powered document QA endpoint with Azure OpenAI and caching"""
     try:
         document_id = None
 
@@ -1119,23 +1232,32 @@ async def process_document_qa_rag(
             text, document_id, original_filename, sanitized_filename = await DocumentProcessor.process_document_from_source(
                 request.documents)
 
-            try:
-                # Check if vectors already exist
-                await vector_store._load_from_supabase_direct(document_id)
-                logger.info(f"✅ Using existing vectors for document: {document_id}")
-            except HTTPException:
-                # Create new vectors only if they don't exist
-                logger.info(f"📝 Creating new vectors for document: {document_id}")
-                chunks = DocumentProcessor.intelligent_chunking(text)
-                source_info = {
-                    "source_url": request.documents,
-                    "source_type": "api_request",
-                    "processed_via": "hackrx_endpoint",
-                    "original_filename": original_filename,
-                    "sanitized_filename": sanitized_filename,
-                    "ingested_at": time.time()
-                }
-                await vector_store.create_embeddings(document_id, chunks, original_filename, source_info)
+            # Check if already cached first (fastest)
+            if vector_store.cache.is_cached(document_id):
+                logger.info(f"✅ Document already in cache: {document_id}")
+            else:
+                # Check Supabase
+                try:
+                    await vector_store._load_from_supabase_direct(document_id)
+                    logger.info(f"✅ Using existing vectors from Supabase for: {document_id}")
+                    # Load into cache for future use
+                    embeddings, chunks = await vector_store._load_from_supabase_direct(document_id)
+                    metadata = {"document_id": document_id, "file_name": original_filename}
+                    vector_store.cache.set(document_id, embeddings, chunks, metadata)
+                except HTTPException:
+                    # Create new vectors
+                    logger.info(f"📝 Creating new vectors for document: {document_id}")
+                    chunks = DocumentProcessor.intelligent_chunking(text)
+                    source_info = {
+                        "source_url": request.documents,
+                        "source_type": "api_request",
+                        "processed_via": "hackrx_endpoint",
+                        "original_filename": original_filename,
+                        "sanitized_filename": sanitized_filename,
+                        "ingested_at": time.time()
+                    }
+                    # This will automatically cache
+                    await vector_store.create_embeddings(document_id, chunks, original_filename, source_info)
 
         elif request.document_id:
             document_id = request.document_id
@@ -1151,7 +1273,7 @@ async def process_document_qa_rag(
             """Process a single question and return answer with sources"""
             logger.info(f"🔍 Processing question {index + 1}/{len(request.questions)}: {question[:50]}...")
 
-            # Retrieve relevant chunks
+            # This will use cached data automatically
             relevant_chunks = await vector_store.search_similar_chunks(
                 document_id, question, TOP_K_RETRIEVAL
             )
@@ -1187,11 +1309,11 @@ async def process_document_qa_rag(
                 }
             }
 
-            logger.info(f"✅ Completed question {index + 1}: {answer_data.get('answer', '')[:50]}...")
+            logger.info(f"✅ Completed question {index + 1}")
             return detailed_answer
 
         # Process all questions concurrently for maximum speed
-        logger.info(f"🚀 Processing {len(request.questions)} questions in parallel...")
+        logger.info(f"🚀 Processing {len(request.questions)} questions in parallel (using cache)...")
         detailed_answers = await asyncio.gather(*[
             process_single_question(question, i)
             for i, question in enumerate(request.questions)
@@ -1203,6 +1325,8 @@ async def process_document_qa_rag(
             "document_id": document_id,
             "total_questions": len(request.questions),
             "search_type": "document_specific",
+            "cache_hit": vector_store.cache.is_cached(document_id),
+            "response_format": "markdown",  # Add this line
             "processing_info": {
                 "llm_service": "Azure OpenAI",
                 "model_used": azure_openai_service.model_name,
@@ -1308,12 +1432,13 @@ async def delete_document(
         document_id: str,
         token: str = Depends(verify_token)
 ):
-    """Delete a document and its vector data"""
+    """Delete a document from Supabase and cache"""
     try:
+        # This will remove from both cache and Supabase
         success = await vector_store.delete_document_vectors(document_id)
 
         return {
-            "message": f"Document {document_id} deleted",
+            "message": f"Document {document_id} deleted from cache and Supabase",
             "document_id": document_id,
             "success": success
         }
@@ -1377,6 +1502,69 @@ async def cloud_run_request_middleware(request: Request, call_next):
         raise
 
 
+@app.post("/api/v1/cache/refresh")
+async def refresh_cache(token: str = Depends(verify_token)):
+    """
+    Manually refresh the vector cache
+    Useful after uploading new documents
+    """
+    try:
+        logger.info("🔄 Manual cache refresh requested")
+
+        # Clear existing cache
+        vector_store.cache.clear()
+
+        # Preload all vectors
+        await vector_store.preload_all_vectors()
+
+        # Get stats
+        stats = vector_store.cache.get_stats()
+
+        return {
+            "message": "Cache refreshed successfully",
+            "stats": stats
+        }
+    except Exception as e:
+        logger.error(f"Error refreshing cache: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to refresh cache: {str(e)}"
+        )
+
+
+@app.get("/api/v1/cache/stats")
+async def get_cache_stats(token: str = Depends(verify_token)):
+    """Get current cache statistics"""
+    try:
+        stats = vector_store.cache.get_stats()
+        return {
+            "cache_stats": stats,
+            "embedding_model": EMBEDDING_MODEL_NAME
+        }
+    except Exception as e:
+        logger.error(f"Error getting cache stats: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get cache stats: {str(e)}"
+        )
+
+
+@app.post("/api/v1/cache/clear")
+async def clear_cache(token: str = Depends(verify_token)):
+    """Clear the entire cache (memory only, Supabase data remains)"""
+    try:
+        vector_store.cache.clear()
+        return {
+            "message": "Cache cleared successfully",
+            "note": "Supabase data remains intact"
+        }
+    except Exception as e:
+        logger.error(f"Error clearing cache: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to clear cache: {str(e)}"
+        )
+
 @app.exception_handler(HTTPException)
 async def http_exception_handler(request: Request, exc: HTTPException):
     """HTTP exception handler"""
@@ -1407,7 +1595,7 @@ async def general_exception_handler(request: Request, exc: Exception):
 
 @app.on_event("startup")
 async def startup_event():
-    """Initialize services on startup"""
+    """Initialize services and preload vectors on startup"""
     global vector_store, azure_openai_service
 
     logger.info("🚀 Starting RAG-Powered Document QA API with Azure OpenAI")
@@ -1436,6 +1624,15 @@ async def startup_event():
     except Exception as e:
         logger.error(f"❌ Failed to initialize Azure OpenAI service: {e}")
         raise
+
+    # Preload all vectors into memory cache
+    try:
+        logger.info("🔄 Preloading vectors into memory cache...")
+        await vector_store.preload_all_vectors()
+        stats = vector_store.cache.get_stats()
+        logger.info(f"✅ Cache preloaded: {stats['total_documents']} documents, {stats['total_chunks']} chunks")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to preload vectors (will load on-demand): {e}")
 
     logger.info("🚀 Startup initialization complete")
 
