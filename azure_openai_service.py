@@ -92,7 +92,7 @@ class AzureOpenAIService:
             relevant_chunks: List[Dict[str, Any]],
             document_id: str,
             temperature: float = 0.3,
-            max_tokens: int = 500
+            max_tokens: int = 800
     ) -> Dict[str, Any]:
         """
         Generate answer using RAG approach with Azure OpenAI
