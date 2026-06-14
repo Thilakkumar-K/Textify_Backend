@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """
 Enhanced FastAPI Backend with RAG for Document Question Answering
-Uses FAISS for vector search, Azure OpenAI for generation, and Supabase for storage
+Uses FAISS for vector search, OpenRouter for generation, and Supabase for storage
 Production-ready with intelligent chunking and semantic retrieval - NO LOCAL STORAGE
 """
 
@@ -44,8 +44,9 @@ from nltk.tokenize import sent_tokenize
 import re
 from urllib.parse import urlparse, parse_qs
 
-# Azure OpenAI integration
-from azure_openai_service import AzureOpenAIService
+# OpenRouter LLM integration
+from openrouter_service import OpenRouterService, AVAILABLE_MODELS
+from session_manager import get_session_manager, TemporarySession
 
 # Supabase storage utilities
 from supabase_utils import (
@@ -104,9 +105,9 @@ load_dotenv()
 
 # Initialize FastAPI app
 app = FastAPI(
-    title="RAG-Powered Document QA API with Azure OpenAI",
-    description="Advanced Document Question Answering with Retrieval-Augmented Generation using Azure OpenAI",
-    version="3.0.0",
+    title="RAG-Powered Document QA API with OpenRouter",
+    description="Advanced Document Question Answering with Retrieval-Augmented Generation using OpenRouter",
+    version="3.1.0",
     docs_url="/api/v1/docs",
     redoc_url="/api/v1/redoc"
 )
@@ -131,15 +132,18 @@ CHUNK_OVERLAP = 200
 TOP_K_RETRIEVAL = 8
 MAX_CONTEXT_LENGTH = 10000
 
+# Global service instances (initialized in startup_event)
+vector_store = None
+llm_service = None
+
 # Log environment variables
 logger.info("🔧 ENVIRONMENT VARIABLES DEBUG:")
 logger.info(f"   SUPABASE_URL: {os.getenv('SUPABASE_URL')}")
 logger.info(
     f"   SUPABASE_KEY: {'*' * (len(os.getenv('SUPABASE_KEY', '')) - 8) + os.getenv('SUPABASE_KEY', '')[-8:] if os.getenv('SUPABASE_KEY') else 'NOT_SET'}")
 logger.info(f"   SUPABASE_BUCKET: {os.getenv('SUPABASE_BUCKET', 'documents')}")
-logger.info(f"   AZURE_OPENAI_ENDPOINT: {os.getenv('AZURE_OPENAI_ENDPOINT', 'NOT_SET')}")
-logger.info(f"   AZURE_OPENAI_API_KEY: {'SET' if os.getenv('AZURE_OPENAI_API_KEY') else 'NOT_SET'}")
-logger.info(f"   AZURE_OPENAI_DEPLOYMENT: {os.getenv('AZURE_OPENAI_DEPLOYMENT_NAME', 'gpt-4')}")
+logger.info(f"   OPENROUTER_API_KEY: {'SET' if os.getenv('OPENROUTER_API_KEY') else 'NOT_SET'}")
+logger.info(f"   OPENROUTER_MODEL: {os.getenv('OPENROUTER_MODEL', 'meta-llama/llama-3.1-8b-instruct:free')}")
 logger.info(f"   VALID_TOKEN: {'SET' if VALID_TOKEN else 'NOT_SET'}")
 
 # Validate environment variables
@@ -149,11 +153,51 @@ if not os.getenv("SUPABASE_URL"):
     raise ValueError("SUPABASE_URL environment variable is required")
 if not os.getenv("SUPABASE_KEY"):
     raise ValueError("SUPABASE_KEY environment variable is required")
-if not os.getenv("AZURE_OPENAI_API_KEY"):
-    raise ValueError("AZURE_OPENAI_API_KEY environment variable is required")
-if not os.getenv("AZURE_OPENAI_ENDPOINT"):
-    raise ValueError("AZURE_OPENAI_ENDPOINT environment variable is required")
+if not os.getenv("OPENROUTER_API_KEY"):
+    raise ValueError("OPENROUTER_API_KEY environment variable is required. Get your key at https://openrouter.ai/keys")
 
+class TemporarySessionCreate(BaseModel):
+    ttl_minutes: int = 60
+
+    @field_validator('ttl_minutes')
+    @classmethod
+    def validate_ttl(cls, v):
+        if v < 5 or v > 240:
+            raise ValueError("TTL must be between 5 and 240 minutes")
+        return v
+
+
+class TemporaryUploadRequest(BaseModel):
+    session_id: str
+
+    @field_validator('session_id')
+    @classmethod
+    def validate_session_id(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Session ID cannot be empty")
+        return v.strip()
+
+
+class TemporaryDocumentQARequest(BaseModel):
+    session_id: str
+    questions: List[str]
+    document_id: Optional[str] = None
+
+    @field_validator('questions')
+    @classmethod
+    def validate_questions(cls, v):
+        if not v or len(v) == 0:
+            raise ValueError("At least one question is required")
+        if len(v) > 10:
+            raise ValueError("Maximum 10 questions allowed per request")
+        return v
+
+    @field_validator('session_id')
+    @classmethod
+    def validate_session_id(cls, v):
+        if not v or not v.strip():
+            raise ValueError("Session ID cannot be empty")
+        return v.strip()
 
 # Request/Response Models
 class DocumentQARequest(BaseModel):
@@ -1128,7 +1172,7 @@ async def health_check():
     except Exception as e:
         supabase_status = f"error: {str(e)[:100]}"
 
-    azure_openai_info = azure_openai_service.get_service_info() if azure_openai_service else {}
+    llm_info = llm_service.get_service_info() if llm_service else {}
     cache_stats = vector_store.cache.get_stats() if vector_store else {}
 
     return {
@@ -1137,9 +1181,10 @@ async def health_check():
         "environment": os.getenv("ENVIRONMENT", "development"),
         "platform": "google-cloud-run",
         "services": {
-            "azure_openai_available": azure_openai_service.client is not None if azure_openai_service else False,
-            "azure_openai_model": azure_openai_info.get("model_name"),
-            "azure_openai_deployment": azure_openai_info.get("deployment_name"),
+            "llm_provider": "OpenRouter",
+            "llm_available": llm_service.client is not None if llm_service else False,
+            "llm_model": llm_info.get("model_name"),
+            "llm_model_display": llm_info.get("model_display_name"),
             "embedding_model": EMBEDDING_MODEL_NAME,
             "vector_store_ready": vector_store is not None,
             "supabase_status": supabase_status,
@@ -1223,7 +1268,7 @@ async def process_document_qa_rag(
         request: DocumentQARequest,
         token: str = Depends(verify_token)
 ):
-    """RAG-powered document QA endpoint with Azure OpenAI and caching"""
+    """RAG-powered document QA endpoint with OpenRouter and caching"""
     try:
         document_id = None
 
@@ -1278,8 +1323,8 @@ async def process_document_qa_rag(
                 document_id, question, TOP_K_RETRIEVAL
             )
 
-            # Generate answer using Azure OpenAI
-            answer_data = await azure_openai_service.generate_rag_answer(
+            # Generate answer using OpenRouter
+            answer_data = await llm_service.generate_rag_answer(
                 question, relevant_chunks, document_id
             )
 
@@ -1328,8 +1373,8 @@ async def process_document_qa_rag(
             "cache_hit": vector_store.cache.is_cached(document_id),
             "response_format": "markdown",  # Add this line
             "processing_info": {
-                "llm_service": "Azure OpenAI",
-                "model_used": azure_openai_service.model_name,
+                "llm_service": "OpenRouter",
+                "model_used": llm_service.model_name,
                 "total_chunks_searched": sum(len(ans["sources"]) for ans in detailed_answers),
                 "avg_confidence": sum(ans["confidence"] for ans in detailed_answers) / len(
                     detailed_answers) if detailed_answers else 0.0
@@ -1354,7 +1399,7 @@ async def global_query(
         request: GlobalQueryRequest,
         token: str = Depends(verify_token)
 ):
-    """Global search across documents with Azure OpenAI"""
+    """Global search across documents with OpenRouter"""
     try:
         if request.document_ids:
             relevant_chunks = await vector_store.search_filtered_documents(
@@ -1374,7 +1419,7 @@ async def global_query(
                 "search_type": search_type
             }
 
-        answer_data = await azure_openai_service.generate_rag_answer(
+        answer_data = await llm_service.generate_rag_answer(
             request.query,
             relevant_chunks,
             "global_search"
@@ -1410,21 +1455,65 @@ async def global_query(
         )
 
 
-@app.get("/api/v1/test-azure-openai")
-async def test_azure_openai():
-    """Test Azure OpenAI connectivity"""
+@app.get("/api/v1/test-llm")
+async def test_llm():
+    """Test OpenRouter LLM connectivity"""
     try:
-        if not azure_openai_service:
-            return {"status": "error", "message": "Azure OpenAI service not initialized"}
+        if not llm_service:
+            return {"status": "error", "message": "OpenRouter service not initialized"}
 
-        result = await azure_openai_service.test_connection()
+        result = await llm_service.test_connection()
         return result
 
     except Exception as e:
         return {
             "status": "error",
-            "message": f"Azure OpenAI test failed: {str(e)}"
+            "message": f"OpenRouter test failed: {str(e)}"
         }
+
+
+@app.get("/api/v1/models")
+async def list_models():
+    """List available OpenRouter models"""
+    return {
+        "current_model": llm_service.model_name if llm_service else None,
+        "available_models": AVAILABLE_MODELS
+    }
+
+
+@app.post("/api/v1/models/switch")
+async def switch_model(
+        model_id: str,
+        token: str = Depends(verify_token)
+):
+    """Hot-switch the active OpenRouter model without restarting"""
+    try:
+        if not llm_service:
+            raise HTTPException(status_code=503, detail="LLM service not initialized")
+
+        old_model = llm_service.model_name
+        success = llm_service.switch_model(model_id)
+
+        if success:
+            return {
+                "status": "success",
+                "old_model": old_model,
+                "new_model": model_id,
+                "display_name": AVAILABLE_MODELS.get(model_id, model_id)
+            }
+        else:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Failed to switch to model: {model_id}. Reverted to {old_model}."
+            )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Model switch failed: {str(e)}"
+        )
 
 
 @app.delete("/api/v1/documents/{document_id}")
@@ -1593,12 +1682,350 @@ async def general_exception_handler(request: Request, exc: Exception):
     )
 
 
+# ============================================================================
+# TEMPORARY CHAT SESSION ENDPOINTS
+# ============================================================================
+
+@app.post("/api/v1/temporary/session/create")
+async def create_temporary_session(
+        request: TemporarySessionCreate,
+        token: str = Depends(verify_token)
+):
+    """Create a new temporary chat session"""
+    try:
+        session_manager = get_session_manager()
+        session_id = session_manager.create_session(ttl_minutes=request.ttl_minutes)
+
+        session = session_manager.get_session(session_id)
+
+        return {
+            "session_id": session_id,
+            "status": "created",
+            "ttl_minutes": request.ttl_minutes,
+            "expires_at": session.expires_at,
+            "message": f"Temporary session created with {request.ttl_minutes} minute TTL"
+        }
+
+    except Exception as e:
+        logger.error(f"Error creating temporary session: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create session: {str(e)}"
+        )
+
+
+@app.post("/api/v1/temporary/upload")
+async def upload_temporary_document(
+        session_id: str,
+        file: UploadFile = File(...),
+        token: str = Depends(verify_token)
+):
+    """Upload document to temporary session (in-memory only, no DB/Supabase)"""
+    try:
+        session_manager = get_session_manager()
+        session = session_manager.get_session(session_id)
+
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Session not found or expired"
+            )
+
+        # Generate document ID
+        document_id = str(uuid.uuid4())
+
+        # Read file content
+        content = await file.read()
+
+        # Process document
+        processor = DocumentProcessor()
+        text = await processor.process_uploaded_file(content, file.filename)
+
+        # Create chunks
+        chunks = processor.intelligent_chunking(text)
+
+        # Create embeddings (in-memory only)
+        texts = [chunk["text"] for chunk in chunks]
+        embeddings = vector_store.embedding_model.encode(texts, show_progress_bar=False)
+
+        # Store in session (no Supabase, no persistent storage)
+        metadata = {
+            "original_filename": file.filename,
+            "file_size": len(content),
+            "content_type": file.content_type,
+            "session_id": session_id
+        }
+
+        session.add_document(
+            doc_id=document_id,
+            filename=file.filename,
+            chunks=chunks,
+            embeddings=embeddings,
+            metadata=metadata
+        )
+
+        logger.info(f"✅ Uploaded temporary document {document_id} to session {session_id}")
+
+        return {
+            "document_id": document_id,
+            "filename": file.filename,
+            "session_id": session_id,
+            "status": "uploaded_to_session",
+            "chunks_created": len(chunks),
+            "storage_type": "temporary_in_memory",
+            "message": f"Document uploaded to temporary session (will be deleted when session expires)",
+            "session_info": session.get_stats()
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error uploading temporary document: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to upload document: {str(e)}"
+        )
+
+
+@app.post("/api/v1/temporary/query")
+async def query_temporary_documents(
+        request: TemporaryDocumentQARequest,
+        token: str = Depends(verify_token)
+):
+    """Query documents in temporary session (uses in-memory data only)"""
+    try:
+        session_manager = get_session_manager()
+        session = session_manager.get_session(request.session_id)
+
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Session not found or expired"
+            )
+
+        # Get document to query
+        if request.document_id:
+            doc_data = session.get_document(request.document_id)
+            if not doc_data:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Document {request.document_id} not found in session"
+                )
+            documents_to_query = [doc_data]
+        else:
+            # Query all documents in session
+            doc_list = session.list_documents()
+            if not doc_list:
+                raise HTTPException(
+                    status_code=status.HTTP_400_BAD_REQUEST,
+                    detail="No documents in session"
+                )
+            documents_to_query = [session.get_document(doc["document_id"]) for doc in doc_list]
+
+        # Process questions
+        async def process_question(question: str, index: int) -> Dict[str, Any]:
+            """Process single question across session documents"""
+            all_results = []
+
+            # Search across all documents in session
+            for doc_data in documents_to_query:
+                chunks = doc_data["chunks"]
+                embeddings = doc_data["embeddings"]
+                doc_id = doc_data["metadata"]["document_id"]
+
+                # Create temporary FAISS index
+                import faiss
+                import numpy as np
+
+                dimension = embeddings.shape[1]
+                index = faiss.IndexFlatIP(dimension)
+                embeddings_normalized = embeddings.astype('float32')
+                faiss.normalize_L2(embeddings_normalized)
+                index.add(embeddings_normalized)
+
+                # Query
+                query_embedding = vector_store.embedding_model.encode([question])
+                query_embedding = query_embedding.astype('float32')
+                faiss.normalize_L2(query_embedding)
+
+                scores, indices = index.search(query_embedding, min(TOP_K_RETRIEVAL, len(chunks)))
+
+                # Collect results
+                for score, idx in zip(scores[0], indices[0]):
+                    if idx != -1:
+                        chunk = chunks[idx].copy()
+                        chunk["similarity_score"] = float(score)
+                        chunk["document_id"] = doc_id
+                        chunk["filename"] = doc_data["metadata"]["filename"]
+                        all_results.append(chunk)
+
+            # Sort by score
+            all_results.sort(key=lambda x: x["similarity_score"], reverse=True)
+            relevant_chunks = all_results[:TOP_K_RETRIEVAL]
+
+            # Generate answer
+            answer_data = await llm_service.generate_rag_answer(
+                question, relevant_chunks, request.session_id
+            )
+
+            return {
+                "question": question,
+                "answer": answer_data.get("answer", "No answer generated"),
+                "confidence": answer_data.get("confidence", 0.0),
+                "sources": [
+                    {
+                        "document_id": chunk["document_id"],
+                        "filename": chunk.get("filename", "unknown"),
+                        "chunk_id": chunk["chunk_id"],
+                        "similarity_score": chunk["similarity_score"],
+                        "chunk_preview": chunk["text"][:150] + "..."
+                    }
+                    for chunk in relevant_chunks[:5]
+                ],
+                "chunks_retrieved": len(relevant_chunks)
+            }
+
+        # Process all questions
+        answers = await asyncio.gather(*[
+            process_question(q, i) for i, q in enumerate(request.questions)
+        ])
+
+        return {
+            "answers": answers,
+            "session_id": request.session_id,
+            "storage_type": "temporary_in_memory",
+            "total_questions": len(request.questions),
+            "session_info": session.get_stats()
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error querying temporary documents: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to query documents: {str(e)}"
+        )
+
+
+@app.get("/api/v1/temporary/session/{session_id}")
+async def get_temporary_session(
+        session_id: str,
+        token: str = Depends(verify_token)
+):
+    """Get information about a temporary session"""
+    try:
+        session_manager = get_session_manager()
+        session = session_manager.get_session(session_id)
+
+        if not session:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Session not found or expired"
+            )
+
+        return {
+            "session": session.get_stats(),
+            "documents": session.list_documents()
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting session: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get session: {str(e)}"
+        )
+
+
+@app.delete("/api/v1/temporary/session/{session_id}")
+async def delete_temporary_session(
+        session_id: str,
+        token: str = Depends(verify_token)
+):
+    """Manually delete a temporary session"""
+    try:
+        session_manager = get_session_manager()
+        success = session_manager.delete_session(session_id)
+
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Session not found"
+            )
+
+        return {
+            "message": f"Session {session_id} deleted successfully",
+            "session_id": session_id
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error deleting session: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to delete session: {str(e)}"
+        )
+
+
+@app.post("/api/v1/temporary/session/{session_id}/extend")
+async def extend_temporary_session(
+        session_id: str,
+        minutes: int = 30,
+        token: str = Depends(verify_token)
+):
+    """Extend session TTL"""
+    try:
+        session_manager = get_session_manager()
+        success = session_manager.extend_session(session_id, minutes)
+
+        if not success:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Session not found or expired"
+            )
+
+        session = session_manager.get_session(session_id)
+
+        return {
+            "message": f"Session extended by {minutes} minutes",
+            "session_id": session_id,
+            "new_expiry": session.expires_at,
+            "time_remaining_seconds": int(session.expires_at - time.time())
+        }
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error extending session: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to extend session: {str(e)}"
+        )
+
+
+@app.get("/api/v1/temporary/sessions/stats")
+async def get_all_sessions_stats(token: str = Depends(verify_token)):
+    """Get statistics for all temporary sessions"""
+    try:
+        session_manager = get_session_manager()
+        return session_manager.get_all_sessions_stats()
+
+    except Exception as e:
+        logger.error(f"Error getting sessions stats: {e}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to get sessions stats: {str(e)}"
+        )
+
 @app.on_event("startup")
 async def startup_event():
     """Initialize services and preload vectors on startup"""
-    global vector_store, azure_openai_service
+    global vector_store, llm_service
 
-    logger.info("🚀 Starting RAG-Powered Document QA API with Azure OpenAI")
+    logger.info("🚀 Starting RAG-Powered Document QA API with OpenRouter")
     logger.info("📡 NO LOCAL STORAGE - All data stored in Supabase")
     logger.info(f"🧠 Embedding model: {EMBEDDING_MODEL_NAME}")
     logger.info(f"⚙️ Chunk size: {CHUNK_SIZE}, Overlap: {CHUNK_OVERLAP}")
@@ -1613,17 +2040,25 @@ async def startup_event():
         logger.error(f"❌ Failed to initialize vector store: {e}")
         raise
 
-    # Initialize Azure OpenAI Service
+    # Initialize OpenRouter LLM Service
     try:
-        azure_openai_service = AzureOpenAIService(
-            endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-            api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-            deployment_name=os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4"),
+        llm_service = OpenRouterService(
+            api_key=os.getenv("OPENROUTER_API_KEY"),
+            model_name=os.getenv("OPENROUTER_MODEL"),
+            app_name=os.getenv("OPENROUTER_APP_NAME", "Microsoft RAG QA"),
         )
-        logger.info("✅ Azure OpenAI service initialized successfully")
+        logger.info(f"✅ OpenRouter service initialized with model: {llm_service.model_name}")
     except Exception as e:
-        logger.error(f"❌ Failed to initialize Azure OpenAI service: {e}")
+        logger.error(f"❌ Failed to initialize OpenRouter service: {e}")
         raise
+
+    # Initialize Session Manager for temporary chat
+    try:
+        session_manager = get_session_manager()
+        await session_manager.start_cleanup_task()
+        logger.info("✅ Session manager initialized with automatic cleanup")
+    except Exception as e:
+        logger.warning(f"⚠️ Failed to initialize session manager: {e}")
 
     # Preload all vectors into memory cache
     try:

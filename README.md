@@ -1,21 +1,22 @@
-# RAG-Powered Document QA API with Azure OpenAI
+# RAG-Powered Document QA API with OpenRouter
 
-A production-ready FastAPI backend for intelligent document question answering using Retrieval-Augmented Generation (RAG), FAISS vector search, Azure OpenAI, and Supabase storage.
+A production-ready FastAPI backend for intelligent document question answering using Retrieval-Augmented Generation (RAG), FAISS vector search, OpenRouter LLM, and Supabase storage.
 
 ## 🚀 Features
 
 - **Intelligent Document Processing**: Support for PDF, DOCX, and email formats with smart chunking
-- **RAG Architecture**: Semantic search with FAISS + Azure OpenAI generation
+- **RAG Architecture**: Semantic search with FAISS + OpenRouter LLM generation
 - **High-Performance Caching**: In-memory vector cache for instant retrieval
 - **Cloud Storage**: Supabase integration for persistent storage (no local storage)
 - **Global Search**: Cross-document search capabilities
+- **Hot Model Switching**: Switch between OpenRouter models without restarting
 - **Production Ready**: Built for Google Cloud Run with graceful shutdown handling
 - **Concurrent Processing**: Parallel question processing for maximum throughput
 
 ## 📋 Requirements
 
 - Python 3.9+
-- Azure OpenAI API access
+- OpenRouter API key (get one at https://openrouter.ai/keys)
 - Supabase account with storage bucket
 - Google Cloud Run (for deployment)
 
@@ -42,10 +43,10 @@ Create a `.env` file with the following variables:
 # Authentication
 VALID_TOKEN=your_secure_token_here
 
-# Azure OpenAI Configuration
-AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
-AZURE_OPENAI_API_KEY=your_azure_openai_api_key
-AZURE_OPENAI_DEPLOYMENT_NAME=gpt-4
+# OpenRouter Configuration
+OPENROUTER_API_KEY=sk-or-your-key-here
+OPENROUTER_MODEL=openrouter/free
+OPENROUTER_APP_NAME=Microsoft RAG QA
 
 # Supabase Configuration
 SUPABASE_URL=https://your-project.supabase.co
@@ -203,6 +204,20 @@ DELETE /api/v1/documents/{document_id}
 Authorization: Bearer YOUR_VALID_TOKEN
 ```
 
+### Model Management
+
+```bash
+# List available models
+GET /api/v1/models
+
+# Switch active model (hot-swap)
+POST /api/v1/models/switch?model_id=openai/gpt-4o
+Authorization: Bearer YOUR_VALID_TOKEN
+
+# Test LLM connectivity
+GET /api/v1/test-llm
+```
+
 ### Cache Management
 
 ```bash
@@ -227,7 +242,7 @@ Authorization: Bearer YOUR_VALID_TOKEN
 2. **Intelligent Chunking**: Semantic-aware text splitting with overlap
 3. **Vector Store**: FAISS-based similarity search with embeddings
 4. **In-Memory Cache**: High-performance caching layer for instant retrieval
-5. **Azure OpenAI Service**: LLM-powered answer generation
+5. **OpenRouter Service**: LLM-powered answer generation via OpenRouter API
 6. **Supabase Storage**: Persistent cloud storage for documents and vectors
 
 ### Data Flow
@@ -235,7 +250,7 @@ Authorization: Bearer YOUR_VALID_TOKEN
 ```
 Upload → Extract Text → Chunk → Generate Embeddings → Store (Supabase + Cache)
                                                               ↓
-Query → Retrieve Vectors (Cache/Supabase) → Search → Generate Answer (Azure OpenAI)
+Query → Retrieve Vectors (Cache/Supabase) → Search → Generate Answer (OpenRouter)
 ```
 
 ## ⚙️ Configuration
@@ -298,10 +313,10 @@ python main.py
 gcloud run logs read rag-qa-api --limit 50
 ```
 
-### Test Azure OpenAI
+### Test OpenRouter LLM
 
 ```bash
-curl http://localhost:8000/api/v1/test-azure-openai
+curl http://localhost:8000/api/v1/test-llm
 ```
 
 ## 📝 Example Usage
@@ -358,10 +373,11 @@ For issues and questions:
 
 ## 🔄 Version History
 
-- **v3.0.0**: Current version with in-memory caching and Azure OpenAI
+- **v3.1.0**: Current version — migrated to OpenRouter with hot model switching
+- **v3.0.0**: In-memory caching layer
 - **v2.x**: Supabase storage integration
 - **v1.x**: Initial RAG implementation
 
 ---
 
-**Built with ❤️ using FastAPI, FAISS, Azure OpenAI, and Supabase**
+**Built with ❤️ using FastAPI, FAISS, OpenRouter, and Supabase**

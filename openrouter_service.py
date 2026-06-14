@@ -1,16 +1,51 @@
 """
-Azure OpenAI Service Handler
-Handles all interactions with Azure OpenAI API for RAG-based document QA
+OpenRouter LLM Service Handler
+Handles all interactions with OpenRouter API for RAG-based document QA.
+Uses the OpenAI-compatible API via OpenRouter's endpoint.
+
+Supports easy model switching via OPENROUTER_MODEL env variable.
 """
 
 import logging
 import os
 from typing import List, Dict, Any, Optional
-from openai import AzureOpenAI
+from openai import OpenAI
 import asyncio
 from functools import wraps
 
 logger = logging.getLogger(__name__)
+
+# ──────────────────────────────────────────────────────────────
+# Popular OpenRouter models — change OPENROUTER_MODEL in .env
+# to any of these (or any model listed on openrouter.ai/models)
+# ──────────────────────────────────────────────────────────────
+AVAILABLE_MODELS = {
+    # Free-tier models (no credits needed)
+    "qwen/qwen3.6-plus:free": "Qwen 3.6 Plus (Free)",
+    "nvidia/nemotron-3-super:free": "Nemotron 3 Super (Free)",
+    "nvidia/nemotron-3-nano-30b-a3b:free": "Nemotron 3 Nano 30B (Free)",
+    "stepfun/step-3.5-flash:free": "Step 3.5 Flash (Free)",
+    "z-ai/glm-4.5-air:free": "GLM 4.5 Air (Free)",
+    "arcee-ai/trinity-large-preview:free": "Trinity Large Preview (Free)",
+    "arcee-ai/trinity-mini:free": "Trinity Mini (Free)",
+
+    # Auto-router (picks best free model for your request)
+    "openrouter/free": "Auto Free Router",
+
+    # Paid but affordable
+    "google/gemini-2.0-flash-001": "Gemini 2.0 Flash",
+    "deepseek/deepseek-chat-v3-0324": "DeepSeek V3",
+    "mistralai/mistral-small-3.1-24b-instruct": "Mistral Small 3.1 24B",
+    "anthropic/claude-3.5-haiku": "Claude 3.5 Haiku",
+
+    # Premium
+    "anthropic/claude-3.5-sonnet": "Claude 3.5 Sonnet",
+    "openai/gpt-4o": "GPT-4o",
+    "google/gemini-2.5-pro-preview-03-25": "Gemini 2.5 Pro",
+}
+
+# Default model if none specified — uses OpenRouter's free auto-router
+DEFAULT_MODEL = "openrouter/free"
 
 
 def async_wrap(func):
@@ -24,67 +59,112 @@ def async_wrap(func):
     return run
 
 
-class AzureOpenAIService:
-    """Service class for Azure OpenAI API interactions"""
+class OpenRouterService:
+    """Service class for OpenRouter API interactions (OpenAI-compatible)"""
 
     def __init__(
             self,
             api_key: Optional[str] = None,
-            endpoint: Optional[str] = None,
-            api_version: Optional[str] = None,
-            deployment_name: Optional[str] = None
+            model_name: Optional[str] = None,
+            app_name: Optional[str] = None,
+            app_url: Optional[str] = None,
     ):
         """
-        Initialize Azure OpenAI Service
+        Initialize OpenRouter Service
 
         Args:
-            api_key: Azure OpenAI API key
-            endpoint: Azure OpenAI endpoint URL
-            api_version: API version (default: 2024-02-15-preview)
-            deployment_name: Deployment/model name
+            api_key: OpenRouter API key (starts with sk-or-)
+            model_name: Model identifier (e.g. 'meta-llama/llama-3.1-8b-instruct:free')
+            app_name: Your application name (shown on OpenRouter dashboard)
+            app_url: Your application URL (for OpenRouter rankings)
         """
-        self.api_key = api_key or os.getenv("AZURE_OPENAI_API_KEY")
-        self.endpoint = endpoint or os.getenv("AZURE_OPENAI_ENDPOINT")
-        self.api_version = api_version or os.getenv("AZURE_OPENAI_API_VERSION", "2024-02-15-preview")
-        self.deployment_name = deployment_name or os.getenv("AZURE_OPENAI_DEPLOYMENT_NAME", "gpt-4")
+        self.api_key = api_key or os.getenv("OPENROUTER_API_KEY")
+        self.model_name = model_name or os.getenv("OPENROUTER_MODEL", DEFAULT_MODEL)
+        self.app_name = app_name or os.getenv("OPENROUTER_APP_NAME", "Microsoft RAG QA")
+        self.app_url = app_url or os.getenv("OPENROUTER_APP_URL", "")
+        self.base_url = "https://openrouter.ai/api/v1"
 
         # Validate required credentials
         if not self.api_key:
-            raise ValueError("AZURE_OPENAI_API_KEY environment variable is required")
-        if not self.endpoint:
-            raise ValueError("AZURE_OPENAI_ENDPOINT environment variable is required")
+            raise ValueError(
+                "OPENROUTER_API_KEY environment variable is required. "
+                "Get your key at https://openrouter.ai/keys"
+            )
 
         # Initialize client
         self.client = None
-        self.model_name = None
         self._initialize_client()
 
     def _initialize_client(self):
-        """Initialize Azure OpenAI client"""
+        """Initialize OpenRouter client using the OpenAI SDK"""
         try:
-            self.client = AzureOpenAI(
+            headers = {}
+            if self.app_url:
+                headers["HTTP-Referer"] = self.app_url
+            if self.app_name:
+                headers["X-Title"] = self.app_name
+
+            self.client = OpenAI(
+                base_url=self.base_url,
                 api_key=self.api_key,
-                api_version=self.api_version,
-                azure_endpoint=self.endpoint
+                default_headers=headers,
             )
 
             # Test connection with a simple request
-            test_response = self.client.chat.completions.create(
-                model=self.deployment_name,
-                messages=[{"role": "user", "content": "Test"}],
-                max_tokens=10,
-                temperature=0.1
-            )
-
-            if test_response:
-                self.model_name = self.deployment_name
-                logger.info(f"✅ Successfully initialized Azure OpenAI with deployment: {self.deployment_name}")
+            try:
+                test_response = self.client.chat.completions.create(
+                    model=self.model_name,
+                    messages=[{"role": "user", "content": "Test"}],
+                    max_tokens=10,
+                    temperature=0.1,
+                )
+                if test_response:
+                    logger.info(f"✅ Successfully initialized OpenRouter with model: {self.model_name}")
+                else:
+                    logger.warning(f"⚠️ OpenRouter returned empty test response, but client is ready")
+            except Exception as test_err:
+                logger.warning(f"⚠️ OpenRouter test call failed ({test_err}), but client is initialized. Will retry on first real request.")
 
         except Exception as e:
-            logger.error(f"❌ Failed to initialize Azure OpenAI client: {e}")
+            logger.error(f"❌ Failed to initialize OpenRouter client: {e}")
             self.client = None
-            self.model_name = None
             raise
+
+    # ── public helpers ──────────────────────────────────────────
+
+    def switch_model(self, new_model: str) -> bool:
+        """
+        Hot-switch the active model without restarting the server.
+
+        Args:
+            new_model: OpenRouter model identifier
+
+        Returns:
+            True on success
+        """
+        old_model = self.model_name
+        self.model_name = new_model
+        try:
+            # Quick validation call
+            self.client.chat.completions.create(
+                model=self.model_name,
+                messages=[{"role": "user", "content": "Test"}],
+                max_tokens=5,
+                temperature=0.1,
+            )
+            logger.info(f"🔄 Model switched: {old_model} → {new_model}")
+            return True
+        except Exception as e:
+            logger.error(f"❌ Model switch failed, reverting: {e}")
+            self.model_name = old_model
+            return False
+
+    @staticmethod
+    def list_available_models() -> Dict[str, str]:
+        """Return the curated list of popular models"""
+        return AVAILABLE_MODELS
+
+    # ── RAG answer generation ──────────────────────────────────
 
     async def generate_rag_answer(
             self,
@@ -92,10 +172,10 @@ class AzureOpenAIService:
             relevant_chunks: List[Dict[str, Any]],
             document_id: str,
             temperature: float = 0.3,
-            max_tokens: int = 800
+            max_tokens: int = 800,
     ) -> Dict[str, Any]:
         """
-        Generate answer using RAG approach with Azure OpenAI
+        Generate answer using RAG approach with OpenRouter
 
         Args:
             question: User's question
@@ -109,10 +189,10 @@ class AzureOpenAIService:
         """
         if not self.client:
             return {
-                "answer": "Azure OpenAI service not available",
+                "answer": "OpenRouter service not available",
                 "confidence": 0.0,
                 "sources": [],
-                "chunks_retrieved": 0
+                "chunks_retrieved": 0,
             }
 
         try:
@@ -124,7 +204,7 @@ class AzureOpenAIService:
                     "answer": "No relevant context found in the document to answer this question.",
                     "confidence": 0.0,
                     "sources": [],
-                    "chunks_retrieved": 0
+                    "chunks_retrieved": 0,
                 }
 
             # Log top retrieved chunks
@@ -139,12 +219,12 @@ class AzureOpenAIService:
             # Create RAG prompt
             system_prompt, user_prompt = self._create_rag_prompts(question, context)
 
-            # Generate response using Azure OpenAI
+            # Generate response via OpenRouter
             response = await self._generate_completion(
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 temperature=temperature,
-                max_tokens=max_tokens
+                max_tokens=max_tokens,
             )
 
             if response:
@@ -156,7 +236,7 @@ class AzureOpenAIService:
                     {
                         "chunk_id": chunk["chunk_id"],
                         "similarity_score": chunk["similarity_score"],
-                        "preview": chunk["text"][:200] + "..." if len(chunk["text"]) > 200 else chunk["text"]
+                        "preview": chunk["text"][:200] + "..." if len(chunk["text"]) > 200 else chunk["text"],
                     }
                     for chunk in relevant_chunks[:3]
                 ]
@@ -168,15 +248,15 @@ class AzureOpenAIService:
                     "confidence": confidence,
                     "sources": sources,
                     "chunks_retrieved": len(relevant_chunks),
-                    "model_used": self.model_name
+                    "model_used": self.model_name,
                 }
             else:
-                logger.error("❌ Azure OpenAI returned empty response")
+                logger.error("❌ OpenRouter returned empty response")
                 return {
-                    "answer": "Unable to generate response - empty response from Azure OpenAI",
+                    "answer": "Unable to generate response - empty response from OpenRouter",
                     "confidence": 0.0,
                     "sources": [],
-                    "chunks_retrieved": len(relevant_chunks)
+                    "chunks_retrieved": len(relevant_chunks),
                 }
 
         except Exception as e:
@@ -185,45 +265,37 @@ class AzureOpenAIService:
                 "answer": f"Error generating answer: {str(e)}",
                 "confidence": 0.0,
                 "sources": [],
-                "chunks_retrieved": len(relevant_chunks)
+                "chunks_retrieved": len(relevant_chunks),
             }
+
+    # ── private helpers ─────────────────────────────────────────
 
     async def _generate_completion(
             self,
             system_prompt: str,
             user_prompt: str,
             temperature: float = 0.2,
-            max_tokens: int = 500
+            max_tokens: int = 500,
     ) -> Optional[str]:
         """
-        Generate completion using Azure OpenAI Chat API
-
-        Args:
-            system_prompt: System message for model behavior
-            user_prompt: User message with question and context
-            temperature: Sampling temperature
-            max_tokens: Maximum tokens in response
-
-        Returns:
-            Generated text response or None
+        Generate completion using OpenRouter Chat API (OpenAI-compatible)
         """
         try:
-            # Run the synchronous API call in a thread pool
             loop = asyncio.get_event_loop()
             response = await loop.run_in_executor(
                 None,
                 lambda: self.client.chat.completions.create(
-                    model=self.deployment_name,
+                    model=self.model_name,
                     messages=[
                         {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_prompt}
+                        {"role": "user", "content": user_prompt},
                     ],
                     temperature=temperature,
                     max_tokens=max_tokens,
                     top_p=0.8,
                     frequency_penalty=0.0,
-                    presence_penalty=0.0
-                )
+                    presence_penalty=0.0,
+                ),
             )
 
             if response and response.choices:
@@ -231,20 +303,11 @@ class AzureOpenAIService:
             return None
 
         except Exception as e:
-            logger.error(f"Error calling Azure OpenAI API: {e}")
+            logger.error(f"Error calling OpenRouter API: {e}")
             raise
 
     def _build_context(self, chunks: List[Dict[str, Any]], max_length: int = 10000) -> str:
-        """
-        Build context string from retrieved chunks
-
-        Args:
-            chunks: List of document chunks
-            max_length: Maximum context length in characters
-
-        Returns:
-            Formatted context string
-        """
+        """Build context string from retrieved chunks"""
         context_parts = []
         total_length = 0
 
@@ -260,16 +323,7 @@ class AzureOpenAIService:
         return "\n".join(context_parts)
 
     def _create_rag_prompts(self, question: str, context: str) -> tuple[str, str]:
-        """
-        Create system and user prompts for RAG
-
-        Args:
-            question: User's question
-            context: Retrieved context
-
-        Returns:
-            Tuple of (system_prompt, user_prompt)
-        """
+        """Create system and user prompts for RAG"""
         system_prompt = """You are a helpful AI assistant who explains documents in a friendly, conversational way.
 
     YOUR PERSONALITY:
@@ -326,19 +380,10 @@ class AzureOpenAIService:
         return system_prompt, user_prompt
 
     def _estimate_confidence(self, chunks: List[Dict[str, Any]]) -> float:
-        """
-        Estimate confidence based on similarity scores
-
-        Args:
-            chunks: Retrieved chunks with similarity scores
-
-        Returns:
-            Confidence score between 0 and 1
-        """
+        """Estimate confidence based on similarity scores"""
         if not chunks:
             return 0.0
 
-        # Weighted average of top chunks
         weights = [1.0, 0.8, 0.6, 0.4, 0.2]
         total_score = 0.0
         total_weight = 0.0
@@ -351,27 +396,22 @@ class AzureOpenAIService:
         confidence = total_score / total_weight if total_weight > 0 else 0.0
         return min(confidence, 1.0)
 
-    async def test_connection(self) -> Dict[str, Any]:
-        """
-        Test Azure OpenAI connection and functionality
+    # ── connection test & info ──────────────────────────────────
 
-        Returns:
-            Dict with test results
-        """
+    async def test_connection(self) -> Dict[str, Any]:
+        """Test OpenRouter connection and functionality"""
         try:
             if not self.client:
                 return {
                     "status": "error",
-                    "message": "Azure OpenAI client not initialized"
+                    "message": "OpenRouter client not initialized",
                 }
 
-            # Test with a simple RAG-style prompt
             test_context = """
 Context: Artificial Intelligence (AI) is a broad field of computer science 
 that aims to create machines capable of performing tasks that typically 
 require human intelligence.
 """
-
             test_question = "What is AI?"
 
             system_prompt, user_prompt = self._create_rag_prompts(test_question, test_context)
@@ -380,37 +420,31 @@ require human intelligence.
                 system_prompt=system_prompt,
                 user_prompt=user_prompt,
                 temperature=0.1,
-                max_tokens=100
+                max_tokens=100,
             )
 
             return {
                 "status": "success",
-                "message": "Azure OpenAI API is working with RAG",
+                "message": "OpenRouter API is working with RAG",
                 "model_name": self.model_name,
-                "deployment_name": self.deployment_name,
+                "model_display_name": AVAILABLE_MODELS.get(self.model_name, self.model_name),
                 "test_response": response if response else "No response text",
-                "endpoint": self.endpoint,
-                "api_version": self.api_version
+                "base_url": self.base_url,
             }
 
         except Exception as e:
             return {
                 "status": "error",
-                "message": f"Azure OpenAI test failed: {str(e)}"
+                "message": f"OpenRouter test failed: {str(e)}",
             }
 
     def get_service_info(self) -> Dict[str, Any]:
-        """
-        Get service configuration information
-
-        Returns:
-            Dict with service details
-        """
+        """Get service configuration information"""
         return {
-            "service": "Azure OpenAI",
+            "service": "OpenRouter",
             "model_available": self.client is not None,
             "model_name": self.model_name,
-            "deployment_name": self.deployment_name,
-            "endpoint": self.endpoint,
-            "api_version": self.api_version
+            "model_display_name": AVAILABLE_MODELS.get(self.model_name, self.model_name),
+            "base_url": self.base_url,
+            "available_models": list(AVAILABLE_MODELS.keys()),
         }
