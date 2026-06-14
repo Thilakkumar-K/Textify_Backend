@@ -4,6 +4,7 @@ Enhanced FastAPI Backend with RAG for Document Question Answering
 Uses FAISS for vector search, OpenRouter for generation, and Supabase for storage
 Production-ready with intelligent chunking and semantic retrieval - NO LOCAL STORAGE
 """
+from __future__ import annotations
 
 from fastapi import FastAPI, HTTPException, Depends, status, Request, UploadFile, File
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
@@ -30,19 +31,22 @@ import signal
 import tempfile
 import mimetypes
 
-# Document processing imports
+# Document processing imports (lightweight)
 import PyPDF2
 import docx
 import email
 
-# RAG and embedding imports
-import faiss
-import numpy as np
-from sentence_transformers import SentenceTransformer
-import nltk
-from nltk.tokenize import sent_tokenize
+# Lightweight imports
 import re
 from urllib.parse import urlparse, parse_qs
+
+# Heavy ML imports — loaded lazily in _deferred_init() to avoid blocking server startup
+# These are set as module-level variables so the rest of the code can use them
+faiss = None
+np = None
+SentenceTransformer = None
+nltk = None
+sent_tokenize = None
 
 # OpenRouter LLM integration
 from openrouter_service import OpenRouterService, AVAILABLE_MODELS
@@ -70,18 +74,41 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-# Download required NLTK data
-try:
-    nltk.data.find('tokenizers/punkt')
-except LookupError:
+
+def _load_heavy_imports():
+    """Load heavy ML libraries (torch, faiss, numpy, nltk, sentence_transformers).
+    Called once during background initialization, NOT at module import time."""
+    global faiss, np, SentenceTransformer, nltk, sent_tokenize
+
+    logger.info("📦 Loading heavy ML libraries (numpy, faiss, nltk, sentence_transformers)...")
+
+    import numpy
+    np = numpy
+
+    import faiss as _faiss
+    faiss = _faiss
+
+    from sentence_transformers import SentenceTransformer as _ST
+    SentenceTransformer = _ST
+
+    import nltk as _nltk
+    nltk = _nltk
+    from nltk.tokenize import sent_tokenize as _sent_tokenize
+    sent_tokenize = _sent_tokenize
+
+    # Download NLTK data
     try:
-        nltk.download('punkt', quiet=True)
-    except:
+        nltk.data.find('tokenizers/punkt')
+    except LookupError:
         try:
-            nltk.download('punkt_tab', quiet=True)
-        except:
-            logger.warning("Could not download NLTK punkt tokenizer")
-            pass
+            nltk.download('punkt', quiet=True)
+        except Exception:
+            try:
+                nltk.download('punkt_tab', quiet=True)
+            except Exception:
+                logger.warning("Could not download NLTK punkt tokenizer")
+
+    logger.info("✅ Heavy ML libraries loaded successfully")
 
 
 # Graceful shutdown handler for Cloud Run
@@ -2023,6 +2050,13 @@ async def get_all_sessions_stats(token: str = Depends(verify_token)):
 async def _deferred_init():
     """Heavy initialization that runs in the background after the server port is open"""
     global vector_store, llm_service
+
+    # Load heavy ML libraries first
+    try:
+        _load_heavy_imports()
+    except Exception as e:
+        logger.error(f"❌ Failed to load ML libraries: {e}")
+        return
 
     # Initialize VectorStore (downloads SentenceTransformer model on first run)
     try:
