@@ -2051,9 +2051,9 @@ async def _deferred_init():
     """Heavy initialization that runs in the background after the server port is open"""
     global vector_store, llm_service
 
-    # Load heavy ML libraries first
+    # Load heavy ML libraries first in a separate thread to not block the event loop
     try:
-        _load_heavy_imports()
+        await asyncio.to_thread(_load_heavy_imports)
     except Exception as e:
         logger.error(f"❌ Failed to load ML libraries: {e}")
         return
@@ -2061,7 +2061,10 @@ async def _deferred_init():
     # Initialize VectorStore (downloads SentenceTransformer model on first run)
     try:
         logger.info("🧠 Loading embedding model (this may take a minute on first deploy)...")
-        vector_store = VectorStore()
+        # Run synchronous VectorStore constructor in a separate thread
+        def _init_vector_store():
+            return VectorStore()
+        vector_store = await asyncio.to_thread(_init_vector_store)
         logger.info("✅ Vector store initialized")
     except Exception as e:
         logger.error(f"❌ Failed to initialize vector store: {e}")
