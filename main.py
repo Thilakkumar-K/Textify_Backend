@@ -1166,6 +1166,12 @@ class VectorStore:
 @app.get("/")
 async def list_all_documents():
     """Root endpoint - List all available documents"""
+    if vector_store is None:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="The service is still loading machine learning models in the background. Please refresh the page in about 15-30 seconds."
+        )
+
     try:
         documents = await vector_store.list_stored_documents()
 
