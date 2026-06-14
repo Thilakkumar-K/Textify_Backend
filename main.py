@@ -2020,25 +2020,18 @@ async def get_all_sessions_stats(token: str = Depends(verify_token)):
             detail=f"Failed to get sessions stats: {str(e)}"
         )
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize services and preload vectors on startup"""
+async def _deferred_init():
+    """Heavy initialization that runs in the background after the server port is open"""
     global vector_store, llm_service
 
-    logger.info("🚀 Starting RAG-Powered Document QA API with OpenRouter")
-    logger.info("📡 NO LOCAL STORAGE - All data stored in Supabase")
-    logger.info(f"🧠 Embedding model: {EMBEDDING_MODEL_NAME}")
-    logger.info(f"⚙️ Chunk size: {CHUNK_SIZE}, Overlap: {CHUNK_OVERLAP}")
-    logger.info(f"🔍 Top-K retrieval: {TOP_K_RETRIEVAL}")
-    logger.info(f"☁️ Supabase bucket: {os.getenv('SUPABASE_BUCKET', 'documents')}")
-
-    # Initialize VectorStore
+    # Initialize VectorStore (downloads SentenceTransformer model on first run)
     try:
+        logger.info("🧠 Loading embedding model (this may take a minute on first deploy)...")
         vector_store = VectorStore()
         logger.info("✅ Vector store initialized")
     except Exception as e:
         logger.error(f"❌ Failed to initialize vector store: {e}")
-        raise
+        return
 
     # Initialize OpenRouter LLM Service
     try:
@@ -2050,7 +2043,7 @@ async def startup_event():
         logger.info(f"✅ OpenRouter service initialized with model: {llm_service.model_name}")
     except Exception as e:
         logger.error(f"❌ Failed to initialize OpenRouter service: {e}")
-        raise
+        return
 
     # Initialize Session Manager for temporary chat
     try:
@@ -2069,7 +2062,22 @@ async def startup_event():
     except Exception as e:
         logger.warning(f"⚠️ Failed to preload vectors (will load on-demand): {e}")
 
-    logger.info("🚀 Startup initialization complete")
+    logger.info("🚀 Deferred initialization complete")
+
+
+@app.on_event("startup")
+async def startup_event():
+    """Lightweight startup — opens the port immediately, then initializes in the background"""
+    logger.info("🚀 Starting RAG-Powered Document QA API with OpenRouter")
+    logger.info("📡 NO LOCAL STORAGE - All data stored in Supabase")
+    logger.info(f"🧠 Embedding model: {EMBEDDING_MODEL_NAME}")
+    logger.info(f"⚙️ Chunk size: {CHUNK_SIZE}, Overlap: {CHUNK_OVERLAP}")
+    logger.info(f"🔍 Top-K retrieval: {TOP_K_RETRIEVAL}")
+    logger.info(f"☁️ Supabase bucket: {os.getenv('SUPABASE_BUCKET', 'documents')}")
+
+    # Launch heavy init as a background task so the port opens immediately
+    asyncio.create_task(_deferred_init())
+    logger.info("⏳ Server is up — model loading and cache preload running in background...")
 
 if __name__ == "__main__":
     import uvicorn
