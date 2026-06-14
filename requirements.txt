@@ -1,0 +1,36 @@
+# FastAPI and Server
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+
+# OpenAI SDK (used for OpenRouter's OpenAI-compatible API)
+openai==1.54.3
+
+# Document Processing
+PyPDF2==3.0.1
+python-docx==1.1.0
+python-magic==0.4.27
+
+# RAG and Embeddings
+sentence-transformers==2.2.2
+faiss-cpu==1.7.4
+numpy==1.24.3
+
+# NLP
+nltk==3.8.1
+
+# HTTP Client
+httpx==0.24.1
+
+# Supabase Storage
+supabase==2.0.3
+storage3==0.5.4
+
+# Utilities
+python-dotenv==1.0.0
+pydantic==2.5.0
+pydantic-settings==2.1.0
+
+# Optional: For better async support
+aiofiles==23.2.1
+asyncio==3.4.3

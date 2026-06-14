@@ -403,7 +403,7 @@ test-reports/
 *.csv
 *.json
 *.xml
-*.txt
+
 # Note: Remove specific extensions above if you need to commit sample files
 
 # Jupyter notebook checkpoints
